@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Internship Tracker</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#667;--card:#f5f6f8;--line:#dde0e5;--acc:#1f5fbf;--ok:#d8f3dc;--pend:#fff3cd}
+@media(prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e8e8e8;--mut:#9aa;--card:#1f2226;--line:#33373d;--acc:#7fb0ff;--ok:#1f4d2b;--pend:#5a4a14}}
+*{box-sizing:border-box}body{margin:0;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0);background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+main{max-width:1200px;margin:auto;padding:16px}a{color:var(--acc)}h1{margin:0 0 4px;font-size:22px}.mut{color:var(--mut)}
+.src{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;margin:14px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.tabs button,.more{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:6px 10px;cursor:pointer}
+.tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+.ctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.ctl input,.ctl select{padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;min-width:900px}
+th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}th{background:var(--card);position:sticky;top:0}
+.b{padding:1px 8px;border-radius:10px;font-size:12px}.Applied{background:var(--ok)}.Pending{background:var(--pend)}.new{color:#c0392b;font-weight:600;font-size:11px}.gone{opacity:.5}
+details{margin-top:12px}
+</style></head><body><main>
+<h1>Internship Tracker</h1>
+<div class="mut">Refreshed <span id="gen"></span> &middot; <a id="dl" href="#">Download Excel</a> &middot; Status (Applied/Pending) comes from the Excel file; edit it there.</div>
+<div class="src" id="src"></div>
+<div class="tabs" id="tabs"></div>
+<div class="ctl"><input id="q" type="search" placeholder="Search company, role, location"><select id="st"><option value="">All statuses</option><option>Pending</option><option>Applied</option></select>
+<label><input type="checkbox" id="nw"> New in last 3 days</label><span class="mut" id="cnt"></span></div>
+<div class="wrap"><table><thead><tr><th>Status</th><th>Company</th><th>Role</th><th>Location</th><th>Posted</th><th>Links</th><th>Flags</th><th>Source</th></tr></thead><tbody id="tb"></tbody></table></div>
+<p><button class="more" id="more">Show more</button></p>
+<details><summary>All source links</summary><ul id="lk"></ul></details>
+</main>
+<script id="d" type="application/json">__DATA__</script>
+<script>
+const D=JSON.parse(document.getElementById('d').textContent),$=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const ok=u=>/^https?:\/\//.test(u||'')?esc(u):'';const A=(u,t)=>ok(u)?`<a href="${ok(u)}" target="_blank" rel="noopener noreferrer">${t}</a>`:'';
+let tab=D.roles[0].name,shown=300;
+$('#gen').textContent=D.generated;$('#dl').href=D.xlsx;
+$('#src').innerHTML=D.sources.map(s=>`<div class="card"><b><a href="${ok(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.name)}</a></b><br>
+Last list update: <b>${esc(s.commit.date||'unknown')} UTC</b> ${s.commit.sha?`(${A(s.commit.url,esc(s.commit.sha))})`:''}<br><span class="mut">${s.rows} roles scraped &middot; ${s.new} new this run</span></div>`).join('');
+$('#lk').innerHTML=D.links.map(l=>`<li>${A(l.u,esc(l.n))}</li>`).join('');
+function tabs(){$('#tabs').innerHTML=D.roles.map(r=>`<button class="${r.name===tab?'on':''}" data-t="${esc(r.name)}">${esc(r.name)} (${r.rows.length})</button>`).join('')}
+function render(){
+ const q=$('#q').value.toLowerCase(),st=$('#st').value,nw=$('#nw').checked,cut=new Date(Date.now()-3*864e5).toISOString().slice(0,10);
+ const rows=D.roles.find(r=>r.name===tab).rows.filter(r=>(!st||r.st===st)&&(!nw||r.fs>=cut)&&(!q||(r.co+' '+r.ro+' '+r.lo).toLowerCase().includes(q)));
+ $('#cnt').textContent=rows.length+' roles';
+ $('#tb').innerHTML=rows.slice(0,shown).map(r=>`<tr class="${r.ls==='No'?'gone':''}"><td><span class="b ${r.st==='Applied'?'Applied':'Pending'}">${esc(r.st)}</span></td>
+<td>${esc(r.co)} ${r.fs>=cut?'<span class="new">NEW</span>':''}</td><td>${esc(r.ro)}</td><td>${esc(r.lo)}</td><td>${esc(r.dt)}</td>
+<td>${[A(r.ap,'Apply'),A(r.si,'Simplify'),A(r.ws,'Site')].filter(Boolean).join(' &middot; ')}</td><td>${esc(r.fl)}</td><td class="mut">${esc(r.so)}</td></tr>`).join('');
+ $('#more').style.display=rows.length>shown?'':'none';}
+$('#tabs').onclick=e=>{const t=e.target.dataset.t;if(t){tab=t;shown=300;tabs();render()}};
+['q','st','nw'].forEach(i=>$('#'+i).oninput=()=>{shown=300;render()});
+$('#more').onclick=()=>{shown+=300;render()};
+tabs();render();
+</script></body></html>

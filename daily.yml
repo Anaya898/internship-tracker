@@ -1,0 +1,38 @@
+name: Twice-daily internship update
+on:
+  schedule:
+    # Candidate UTC times; the gate step keeps only 10:00 and 21:00 America/Chicago (handles daylight saving)
+    - cron: "0 15,16 * * *"
+    - cron: "0 2,3 * * *"
+  workflow_dispatch: {}      # manual run from the Actions tab
+permissions:
+  contents: write
+concurrency:
+  group: tracker
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - id: gate
+        run: |
+          H=$(TZ=America/Chicago date +%H)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$H" = "10" ] || [ "$H" = "21" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with: { python-version: "3.12" }
+      - if: steps.gate.outputs.go == 'true'
+        run: pip install -r requirements.txt
+      - if: steps.gate.outputs.go == 'true'
+        run: python update_tracker.py --xlsx tracker/Internship_Tracker.xlsx --site docs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - if: steps.gate.outputs.go == 'true'
+        run: |
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Update $(date -u +'%F %H:%M') UTC"
+          git pull --rebase -q && git push
