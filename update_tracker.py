@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Daily internship tracker.
+"""Internship tracker -> Google Sheet.
 
-Scrapes the GitHub internship lists, merges them into an Excel workbook (one sheet
-per role, Applied/Pending column that is NEVER overwritten) and rebuilds a static site.
+Scrapes the GitHub internship lists and syncs them into a Google Sheet (one tab per role).
+Your Status / Notes columns are read back from the Sheet on every run and never overwritten.
 
-  python update_tracker.py --xlsx "C:/path/Internship_Tracker.xlsx" --site docs
+  python update_tracker.py --sheet-id <ID> [--import-xlsx old.xlsx]   (needs env GOOGLE_SA_JSON)
+  python update_tracker.py --dry-run                                  (scrape only, touches nothing)
 """
 import argparse, datetime as dt, hashlib, json, os, re, shutil
 from pathlib import Path
@@ -34,7 +35,7 @@ EXTRA_LINKS = [
     ("SWEList email alerts", "https://swelist.com"),
 ]
 ROLES = ["Business Analyst", "Data Sci-AI-ML", "Product Mgmt", "Software Eng", "Quant Finance", "Hardware Eng", "Other"]
-COLS = ["Status", "Company", "Role", "Location", "Date Posted", "Apply", "Simplify", "Company Site", "Salary",
+COLS = ["Status", "New", "Company", "Role", "Location", "Date Posted", "Apply", "Simplify", "Company Site", "Salary",
         "Flags", "Source", "First Seen", "Last Seen", "Still Listed", "Notes", "ID"]
 LOG_COLS = ["Run (UTC)", "Source", "Repo", "Branch", "Last commit (UTC)", "Commit", "Changed since last run",
             "Rows scraped", "New rows", "Commit link"]
@@ -246,45 +247,100 @@ def load_state(path):
     return state, log, wb
 
 
-# ---------- Excel ----------
-def write_sheet(wb, title, header, rows, widths, link_cols=(), hide=(), validate=False):
-    if title in wb.sheetnames:
-        del wb[title]
-    ws = wb.create_sheet(title, len(wb.sheetnames) if title in ("Update Log", "Sources") else ROLES.index(title) if title in ROLES else None)
-    ws.append(header)
-    for c in ws[1]:
-        c.font, c.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F3864")
-        c.alignment = Alignment(vertical="center")
-    for r in rows:
-        ws.append([v if not isinstance(v, tuple) else v[1] for v in r])
-        for i, v in enumerate(r):
-            if isinstance(v, tuple) and v[0]:
-                cell = ws.cell(row=ws.max_row, column=i + 1)
-                cell.hyperlink, cell.font = v[0], Font(color="0563C1", underline="single")
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    for h in hide:
-        ws.column_dimensions[h].hidden = True
-    ws.freeze_panes = "C2" if validate else "A2"
-    ws.auto_filter.ref = ws.dimensions
-    if validate and ws.max_row > 1:
-        dv = DataValidation(type="list", formula1='"Pending,Applied"', allow_blank=False)
-        ws.add_data_validation(dv)
-        dv.add(f"A2:A{ws.max_row}")
-        rng = f"A2:A{ws.max_row}"
-        ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"Applied"'], fill=PatternFill("solid", bgColor="C6EFCE", fgColor="C6EFCE")))
-        ws.conditional_formatting.add(rng, CellIsRule(operator="equal", formula=['"Pending"'], fill=PatternFill("solid", bgColor="FFEB9C", fgColor="FFEB9C")))
-    return ws
+# ---------- Google Sheets ----------
+A1 = lambda t, rng: "'" + t.replace("'", "''") + "'!" + rng
+TEXT_COLS = [2, 3, 4, 5, 9, 10, 11, 12, 13, 15, 16]          # kept as plain text (dates, ids, notes...)
+WIDTHS = [80, 55, 200, 320, 170, 90, 70, 80, 100, 80, 130, 170, 90, 90, 80, 220, 110]
+LOG_TEXT, LOG_W = [0, 1, 2, 3, 4, 5, 6], [130, 200, 260, 60, 140, 70, 110, 90, 70, 80]
+STATUSES = ["Pending", "Applied", "Skip"]
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--xlsx", default="tracker/Internship_Tracker.xlsx")
-    ap.add_argument("--site", default="docs")
-    a = ap.parse_args()
-    path = Path(a.xlsx)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def rgb(h):
+    return {k: int(h[i:i + 2], 16) / 255 for k, i in (("red", 0), ("green", 2), ("blue", 4))}
 
+
+def meta(sh):
+    return {x["properties"]["title"]: x["properties"] for x in sh.fetch_sheet_metadata()["sheets"]}
+
+
+def ensure_tab(sh, title, ncols, widths, text_cols, role=False):
+    """Return (sheetId, rowCount); creates and formats the tab the first time."""
+    props = meta(sh).get(title)
+    if props:
+        return props["sheetId"], props["gridProperties"]["rowCount"]
+    sh.batch_update({"requests": [{"addSheet": {"properties": {"title": title, "gridProperties": {
+        "rowCount": 6000, "columnCount": max(ncols, 10), "frozenRowCount": 1}}}}]})
+    sid = meta(sh)[title]["sheetId"]
+    rng = lambda i, r0=1: {"sheetId": sid, "startRowIndex": r0, "endRowIndex": 6000, "startColumnIndex": i, "endColumnIndex": i + 1}
+    dim = lambda i, props, f: {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1}, "properties": props, "fields": f}}
+    reqs = [
+        {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {"backgroundColor": rgb("1F3864"), "textFormat": {"bold": True, "foregroundColor": rgb("FFFFFF")}}},
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)"}},
+        {"setBasicFilter": {"filter": {"range": {"sheetId": sid, "startRowIndex": 0, "startColumnIndex": 0, "endColumnIndex": ncols}}}},
+    ]
+    reqs += [{"repeatCell": {"range": rng(i), "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+                             "fields": "userEnteredFormat.numberFormat"}} for i in text_cols]
+    reqs += [dim(i, {"pixelSize": w}, "pixelSize") for i, w in enumerate(widths)]
+    if role:
+        rule = lambda i, text, color: {"addConditionalFormatRule": {"index": 0, "rule": {"ranges": [rng(i)], "booleanRule": {
+            "condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": text}]}, "format": {"backgroundColor": rgb(color)}}}}}
+        reqs += [
+            {"setDataValidation": {"range": rng(0), "rule": {"condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in STATUSES]},
+                                                             "showCustomUi": True, "strict": True}}},
+            rule(0, "Applied", "C6EFCE"), rule(0, "Pending", "FFEB9C"), rule(0, "Skip", "D9D9D9"), rule(1, "NEW", "BDD7EE"),
+            dim(ncols - 1, {"hiddenByUser": True}, "hiddenByUser"),
+            {"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"frozenColumnCount": 3}}, "fields": "gridProperties.frozenColumnCount"}},
+        ]
+    sh.batch_update({"requests": reqs})
+    return sid, 6000
+
+
+def write_tab(sh, title, header, rows, widths, text_cols, role=False):
+    sid, nrows = ensure_tab(sh, title, len(header), widths, text_cols, role)
+    if len(rows) + 100 > nrows:
+        sh.batch_update({"requests": [{"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"rowCount": len(rows) + 500}},
+                                                                   "fields": "gridProperties.rowCount"}}]})
+    sh.values_clear(A1(title, f"A2:{get_column_letter(len(header))}"))
+    sh.values_update(A1(title, "A1"), params={"valueInputOption": "USER_ENTERED"}, body={"values": [header] + rows})
+
+
+def read_tab(sh, title, titles):
+    if title not in titles:
+        return []
+    return sh.values_get(A1(title, "A1:Z"), params={"valueRenderOption": "FORMULA"}).get("values", [])
+
+
+def link(u, label):
+    return f'=HYPERLINK("{u.replace(chr(34), "%22")}","{label}")' if u else ""
+
+
+def link_url(v):
+    m = re.match(r'=HYPERLINK\("([^"]*)"', v or "")
+    return m.group(1) if m else (v if (v or "").startswith("http") else "")
+
+
+def read_state(sh, titles):
+    state = {}
+    for t in ROLES:
+        v = read_tab(sh, t, titles)
+        if len(v) < 2 or "ID" not in v[0]:
+            continue
+        ix = {h: i for i, h in enumerate(v[0])}
+        for row in v[1:]:
+            g = lambda k: row[ix[k]] if k in ix and ix[k] < len(row) else ""
+            if not g("ID"):
+                continue
+            state[g("ID")] = dict(
+                id=g("ID"), cat=t, status=g("Status") or "Pending", notes=g("Notes"), company=g("Company"), role=g("Role"),
+                location=g("Location"), posted=g("Date Posted"), apply=link_url(g("Apply")), simplify=link_url(g("Simplify")),
+                site=link_url(g("Company Site")), salary=g("Salary"), flags=g("Flags"),
+                sources={x for x in g("Source").split(", ") if x}, first_seen=g("First Seen"), last_seen=g("Last Seen"))
+    return state
+
+
+# ---------- main flow ----------
+def scrape():
     fresh, counts, infos = {}, {}, {}
     for s in SOURCES:
         try:
@@ -303,13 +359,19 @@ def main():
                     o[k] = o[k] or r[k]
             else:
                 fresh[i] = r
-    if not fresh:
-        raise SystemExit("Nothing scraped - leaving workbook untouched.")
+    if len(fresh) < 300:
+        raise SystemExit(f"Only {len(fresh)} roles scraped - something is wrong, leaving the Sheet untouched.")
+    return fresh, counts, infos
 
-    state, log, wb = load_state(path)
-    wb = wb or Workbook()
-    if wb.sheetnames == ["Sheet"]:
-        del wb["Sheet"]
+
+def run(sh, import_xlsx=None):
+    fresh, counts, infos = scrape()
+    titles = meta(sh)  # read the Sheet only AFTER scraping, so the read -> write window stays short
+    state = read_state(sh, titles)
+    if not state and import_xlsx and Path(import_xlsx).exists():
+        state = load_state(Path(import_xlsx))[0]
+        print(f"Imported {len(state)} rows (with Applied marks) from {import_xlsx}")
+    log = [[(l + [""] * 10)[i] if i != 9 else link_url((l + [""] * 10)[9]) for i in range(10)] for l in read_tab(sh, "Update Log", titles)[1:] if l]
 
     final, new_by_src = {}, {k: 0 for k in counts}
     for i, r in fresh.items():
@@ -325,57 +387,54 @@ def main():
     for i, o in state.items():  # rows that disappeared from the lists
         if i in fresh:
             continue
-        age = (TODAY - dt.date.fromisoformat(o["last_seen"])).days if re.match(r"\d{4}-", o["last_seen"]) else 0
-        if o["status"] == "Applied" or age <= 30:
+        age = (TODAY - dt.date.fromisoformat(o["last_seen"])).days if re.match(r"\d{4}-\d\d-\d\d", o["last_seen"] or "") else 0
+        if o["status"] in ("Applied",) or age <= 30:
             o.update(listed="No", sources=sorted(x for x in o["sources"] if x))
             final[i] = o
 
     by_cat = {r: [] for r in ROLES}
     for r in final.values():
-        by_cat.setdefault(r["cat"] if r["cat"] in by_cat else "Other", []).append(r)
+        by_cat[r["cat"] if r["cat"] in by_cat else "Other"].append(r)
+    recent = (TODAY - dt.timedelta(days=2)).isoformat()
     for name in ROLES:
         rows = sorted(by_cat[name], key=lambda r: (r["posted"] or "", r["company"]), reverse=True)
-        write_sheet(wb, name, COLS, [[
-            r["status"], r["company"], r["role"], r["location"], r["posted"],
-            (r["apply"], "Apply"), (r["simplify"], "Simplify" if r["simplify"] else ""), (r["site"], "Site" if r["site"] else ""),
-            r["salary"], r["flags"], ", ".join(r["sources"]), r["first_seen"], r["last_seen"], r["listed"], r["notes"], r["id"]]
-            for r in rows],
-            [10, 28, 46, 26, 12, 9, 10, 8, 10, 22, 26, 12, 12, 10, 30, 14], hide=("P",), validate=True)
-        by_cat[name] = rows
+        write_tab(sh, name, COLS, [[
+            r["status"], "NEW" if r["first_seen"] >= recent else "", r["company"], r["role"], r["location"], r["posted"],
+            link(r["apply"], "Apply"), link(r["simplify"], "Simplify"), link(r["site"], "Site"), r["salary"], r["flags"],
+            ", ".join(r["sources"]), r["first_seen"], r["last_seen"], r["listed"], r["notes"], r["id"]] for r in rows],
+            WIDTHS, TEXT_COLS, role=True)
 
-    # update log (newest first)
     last = {}
-    for row in reversed(log):
+    for row in reversed(log):  # newest first
         last.setdefault(row[1], row[5])
-    run = NOW.strftime("%Y-%m-%d %H:%M")
+    run_ts = NOW.strftime("%Y-%m-%d %H:%M")
     for s in SOURCES:
         c = infos[s["key"]]
         if not c["sha"] or last.get(s["name"]) == c["sha"]:
             continue  # nothing new on GitHub since the last logged commit -> no repeated log rows
-        log.append([run, s["name"], s["repo"], s["branch"], c["date"], c["sha"],
-                    ("Yes" if last.get(s["name"]) != c["sha"] else "No") if c["sha"] else "Unknown", counts[s["key"]], new_by_src[s["key"]], c["url"]])
+        log.append([run_ts, s["name"], s["repo"], s["branch"], c["date"], c["sha"], "Yes", counts[s["key"]], new_by_src[s["key"]], c["url"]])
     log = sorted(log, key=lambda r: str(r[0]), reverse=True)[:600]
-    write_sheet(wb, "Update Log", LOG_COLS, [r[:9] + [(r[9], "commit") if r[9] else ""] for r in log], [18, 28, 38, 8, 20, 10, 12, 12, 10, 10])
-    write_sheet(wb, "Sources", ["Name", "Link"],
-                [[s["name"], (f"https://github.com/{s['repo']}/blob/{s['branch']}/README.md", f"github.com/{s['repo']}")] for s in SOURCES]
-                + [[n, (u, u)] for n, u in EXTRA_LINKS], [40, 90])
-    wb.save(path)
-
-    # website
-    site = Path(a.site)
-    site.mkdir(parents=True, exist_ok=True)
-    keys = dict(id="id", st="status", co="company", ro="role", lo="location", dt="posted", ap="apply", si="simplify", ws="site",
-                sa="salary", fl="flags", fs="first_seen", ls="listed")
-    data = dict(
-        generated=NOW.strftime("%Y-%m-%d %H:%M UTC"), xlsx=path.name,
-        roles=[dict(name=n, rows=[{k: r[v] for k, v in keys.items()} | {"so": ", ".join(r["sources"])} for r in by_cat[n]]) for n in ROLES],
-        sources=[dict(name=s["name"], url=f"https://github.com/{s['repo']}", commit=infos[s["key"]], rows=counts[s["key"]],
-                      new=new_by_src[s["key"]]) for s in SOURCES],
-        links=[dict(n=n, u=u) for n, u in EXTRA_LINKS])
-    html = (Path(__file__).parent / "site_template.html").read_text(encoding="utf-8")
-    (site / "index.html").write_text(html.replace("__DATA__", json.dumps(data, ensure_ascii=False).replace("</", "<\\/")), encoding="utf-8")
-    shutil.copy(path, site / path.name)
+    write_tab(sh, "Update Log", LOG_COLS, [r[:9] + [link(r[9], "commit")] for r in log], LOG_W, LOG_TEXT)
+    write_tab(sh, "Sources", ["Name", "Link"],
+              [[s["name"], link(f"https://github.com/{s['repo']}/blob/{s['branch']}/README.md", f"github.com/{s['repo']}")] for s in SOURCES]
+              + [[n, link(u, u)] for n, u in EXTRA_LINKS], [320, 520], [0])
     print(f"OK: {len(final)} rows | " + " | ".join(f"{n}: {len(by_cat[n])}" for n in ROLES))
+    return final
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sheet-id", default=os.environ.get("SHEET_ID"))
+    ap.add_argument("--import-xlsx", default=None, help="one-time import of Applied marks from an old tracker workbook")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+    if a.dry_run:
+        fresh, counts, _ = scrape()
+        print(f"dry run: {len(fresh)} roles", counts)
+        return
+    import gspread
+    gc = gspread.service_account_from_dict(json.loads(os.environ["GOOGLE_SA_JSON"]))
+    run(gc.open_by_key(a.sheet_id), a.import_xlsx)
 
 
 if __name__ == "__main__":
