@@ -6,7 +6,7 @@ on:
     - cron: "0 2,3 * * *"
   workflow_dispatch: {}      # manual run from the Actions tab
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: tracker
   cancel-in-progress: false
@@ -26,13 +26,8 @@ jobs:
       - if: steps.gate.outputs.go == 'true'
         run: pip install -r requirements.txt
       - if: steps.gate.outputs.go == 'true'
-        run: python update_tracker.py --xlsx tracker/Internship_Tracker.xlsx --site docs
+        run: python update_tracker.py --import-xlsx tracker/Internship_Tracker.xlsx
         env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - if: steps.gate.outputs.go == 'true'
-        run: |
-          git config user.name "tracker-bot"
-          git config user.email "tracker-bot@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || git commit -m "Update $(date -u +'%F %H:%M') UTC"
-          git pull --rebase -q && git push
